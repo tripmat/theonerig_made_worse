@@ -31,7 +31,7 @@ def get_db_engine(username, password, ip_adress, model_name, rdbms="mysql"):
     pd.read_sql_query(test_query, engine)
     return engine
 
-def prompt_credentials(user=None, db_adress=None):
+def prompt_credentials(user=None, db_adress=None, passwd=None):
     """
     Helper function to make a prompt for the password, and additonally the user and the database IP adress
     if left to None.
@@ -45,7 +45,8 @@ def prompt_credentials(user=None, db_adress=None):
     """
     if user is None:
         user = input(prompt='Username: ')
-    passwd = getpass.getpass(prompt='Password: ')
+    if passwd is None: 
+        passwd = getpass.getpass(prompt='Password: ')
     if db_adress is None:
         db_adress = input(prompt='DB IP: ')
     return user, passwd, db_adress

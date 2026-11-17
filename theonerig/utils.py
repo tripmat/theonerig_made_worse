@@ -838,7 +838,9 @@ def stim_recap_df(reM):
             dc = dc_l[0]
             if dc.group == "stim":
                 serie = pd.Series(data=parse_stim(dc), name=cursor)
-                df = df.append(serie, ignore_index=False)
+                #df = df.append(serie, ignore_index=False)
+                df = pd.concat([df, serie.to_frame().T], ignore_index=False)
+
                 cursor+=1
 
     df = df.fillna("")

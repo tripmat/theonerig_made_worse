@@ -586,7 +586,7 @@ def export_record(path, record_master):
         h5_f.attrs["_sep_size"]   = record_master._sep_size
         for i, contig in enumerate(record_master):
             #create contig
-            print("Contiguous sequence",i)
+            #print("Contiguous sequence",i)
             cntig_ref = h5_f.create_group(str(i))
             cntig_ref.attrs["length"] = contig.length
             if fr is not None:
@@ -595,16 +595,16 @@ def export_record(path, record_master):
                 cntig_ref.attrs["_frame_time"] = contig._frame_time
             for key, dc_list in contig._data_dict.items():
                 #create datastream
-                print("...Entering stream",key)
+                #print("...Entering stream",key)
                 stream_ref = cntig_ref.create_group(key)
                 for datachunk in dc_list:
-                    print("......",str(datachunk.idx)+"->"+str(datachunk.idx+len(datachunk)))
+                    #print("......",str(datachunk.idx)+"->"+str(datachunk.idx+len(datachunk)))
                     dset = stream_ref.create_dataset(str(datachunk.idx), data=np.array(datachunk), compression="gzip", compression_opts=4)
                     for attr_k, attr_v in datachunk.attrs.items():
                         dset.attrs[attr_k] = json.dumps(attr_v)
                     dset.attrs["__fill"] = datachunk.fill
                     dset.attrs["__group"] = datachunk.group
-    print()
+    print("Done: " + path)
 
 def import_record(path):
     """Import a Record_Master from an h5 file saved by the export_record function of this library.
@@ -612,7 +612,7 @@ def import_record(path):
     params:
         - path: path of the RecordMaster to import
     """
-    print("Importing the record master")
+    #print("Importing the record master")
     with h5py.File(path, mode="r") as h5_f:
         record_master    = None
         frame_rate = None
@@ -654,5 +654,5 @@ def import_record(path):
                     if kstream in ["main_tp", "signals"] and k==0:
                         continue
                     record_master.set_datachunk(dc, name=kstream, sequence_idx=j)
-    print()
+    #print()
     return record_master

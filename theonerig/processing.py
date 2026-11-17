@@ -8,8 +8,8 @@ __all__ = ['eyetrack_stim_inten', 'saccade_distances', 'smooth_eye_position', 'p
 # Cell
 from functools import partial
 import numpy as np
-from sklearn.decomposition import PCA
-from sklearn import cluster
+#from sklearn.decomposition import PCA
+#from sklearn import cluster
 import scipy.ndimage as ndimage
 import scipy.signal as signal
 import scipy as sp
