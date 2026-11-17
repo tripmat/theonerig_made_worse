@@ -1,6 +1,9 @@
 __all__ = ['get_overlap', "swarmplot_x",'sum_of_gaussians_ChatGPT','fit_sum_of_gaussians', 
            'generate_ticks', "find_spatial_STA_center", "exponentiated_sine_wave_model",
-           "evaluate_fit_of_exponentiated_sine_wave_model", "doeModelInt", "getTFFitLsq"]
+           "evaluate_fit_of_exponentiated_sine_wave_model", "doeModelInt", "getTFFitLsq",
+           "resample_to_rate", "cross_corr_with_lag_2", "get_response_dict_ephyvivo",
+           "cart2pol", "pol2cart", "sta_plotting", "sta_pca_plotting",
+           "retrieve_array", "retrieve_fit", "pval_stars", "plot_stats", "fit_model"]
 
 import h5py
 import json, re
@@ -13,12 +16,19 @@ from matplotlib.patches import Patch
 import difflib
 from scipy.optimize import curve_fit
 import scipy as sp
-from scipy.ndimage import gaussian_filter, zoom
+from scipy.ndimage import gaussian_filter, zoom, convolve1d
 from scipy.signal import convolve2d
-from scipy.stats import norm
+from scipy.stats import norm, percentileofscore
+from scipy import interpolate
 #from scipy.stats import mannwhitneyu
 from sklearn.metrics import mean_squared_error
+from sklearn.decomposition import PCA
 from scipy.special import factorial
+import pandas as pd
+
+from .core import Data_Pipe
+from .processing import process_sta_batch, process_nonlinearity, direction_selectivity
+from .utils import group_direction_response, get_repeat_corrected, removeSlowDrift, time_shift_test_corr
 
 def get_overlap(s1, s2):
     """Longest contiguous matching subsequence
@@ -511,3 +521,460 @@ def getTFFitLsq(tfs, obsresp, initparams, interp_x_axis):
     loglikelihoods = [log_L, log_lb, log_ub]
     
     return popt, loglikelihoods, pve, interpresp
+
+
+# =============================================================================
+# Functions recovered on 2026-11-17 from the folder
+# "Backup python scripts and computer black magic". The source file of each
+# function is noted above it; changes from the original are in its docstring.
+# =============================================================================
+
+# Source: RGCs correlation with motion/Ines Arousal Analysis/
+#         Locomotion_Pupil_corr_analysis_multiple_records.ipynb (2022-07)
+def resample_to_rate(data, sample_rate, new_sample_rate):
+    """
+    Resample data acquired at sample_rate to new_sample_rate by linear interpolation.
+    When downsampling, the data are first smoothed with a boxcar as wide as one new
+    sample, to avoid aliasing.
+
+    params:
+        - data: Data to resample of shape (t, ...)
+        - sample_rate: Sample rate of data in Hz
+        - new_sample_rate: New sample rate of resampled data in Hz
+
+    return:
+        - Resampled data at new_sample_rate
+
+    Change from the notebook version: the original timepoints are built as
+    np.arange(len(data))/sample_rate. np.arange with a float step could return one
+    sample too many, which made the length assertion fail.
+    """
+    timepoints = np.arange(len(data)) / sample_rate
+    ref_timepoints = np.arange(0, len(data)/sample_rate, 1/new_sample_rate)
+    data = np.array(data)
+
+    start_idx = np.argmax(ref_timepoints >= timepoints[0])
+    stop_idx  = np.argmax(ref_timepoints >= timepoints[-1])
+    if stop_idx == 0:
+        stop_idx = len(ref_timepoints)
+
+    if len(ref_timepoints[start_idx:stop_idx]) < len(timepoints): #Downsampling
+        distance = (np.argmax(timepoints>ref_timepoints[start_idx+1])
+                - np.argmax(timepoints>ref_timepoints[start_idx]))
+
+        kernel = np.ones(distance)/distance
+        data = convolve1d(data, kernel, axis=0) #Smooting to avoid weird sampling
+
+    new_data = interpolate.interp1d(timepoints, data, axis=0)(ref_timepoints[start_idx:stop_idx])
+
+    return new_data
+
+
+# Source: same notebook as resample_to_rate (version of 2022-07-18)
+def cross_corr_with_lag_2(spike_counts, behav_signal, behav, conversion_factor_treadmill=None, removeslowdrift=True, fps=60, seconds=30):
+    """
+    Extended version of `utils.cross_corr_with_lag`: also returns the processed signals
+    and the correlation at zero lag with its p-value, and uses 1000 time shifts for the
+    null distribution.
+
+    params:
+        - spike_counts: Array with spike counts for a specific neuron and data chunk from the reM
+        - behav_signal: Array with behavioral signal for a specific neuron and data chunk from the reM
+        - behav : String with name of behavioral signal to be analysed
+        - conversion_factor_treadmill : The value to convert the treadmill signal into cm/s
+        - removeslowdrift: Boolean:
+            False - doesn't remove slow drifts from the signal
+            True - removes slow drifts by extracting a specified percentile within moving window from the signal
+        - fps: Sampling rate
+        - seconds: Window in seconds of the correlation lag
+
+    return:
+        - d1, d2: processed behavioral signal and spiking signal (pandas Series)
+        - crosscorr: Cross-correlation with lag array between behavioral signal and spiking signal
+        - corr_centered: Correlation at zero lag
+        - corr_peak: Correlation at the lag of maximum absolute correlation (with its sign)
+        - p_value_center: P-value of corr_centered against the time-shift null distribution
+        - p_value_peak: P-value of corr_peak against the same null distribution
+        - offset_peak: Lag of the peak in seconds, positive when the spiking signal follows the behavioral signal
+        - null_dist_corr: Null distribution of correlation values (from `utils.time_shift_test_corr`)
+
+    Change from the notebook version: the zero-lag index is len(crosscorr)//2. The notebook,
+    like `utils.cross_corr_with_lag`, used ceil(len(crosscorr)/2), which is one frame past
+    zero lag, so corr_centered and offset_peak were shifted by one frame.
+    """
+    if behav == "treadmill":
+        #Convert treadmill signal to running speed (cm/s)
+        behav_signal = behav_signal * conversion_factor_treadmill
+        behav_signal_filtered = gaussian_filter(abs(behav_signal), sigma=60)
+    else:
+        behav_signal_filtered = gaussian_filter(behav_signal, sigma=60)
+
+    #Convolve signals with gaussian window of 1 second/60 frame
+    spike_counts_filtered = gaussian_filter(spike_counts, sigma=60)
+
+    if removeslowdrift:
+        #Remove slow drifts from treadmill, pupil size and spiking signal
+        spike_counts_detrend = removeSlowDrift(spike_counts_filtered, fps=60, window=100, percentile=8)
+        behav_signal_detrend = removeSlowDrift(behav_signal_filtered, fps=60, window=100, percentile=8)
+    else:
+        spike_counts_detrend = spike_counts_filtered
+        behav_signal_detrend = behav_signal_filtered
+
+    #Get null distribution for correlation between behav_signal and spike_counts signal
+    null_dist_corr = time_shift_test_corr(spike_counts_detrend, behav_signal_detrend, n_tests = 1000)
+
+    #Compute cross-correlation with lag and values to plot
+    d1 = pd.Series(behav_signal_detrend)
+    d2 = pd.Series(spike_counts_detrend)
+    crosscorr = [d1.corr(d2.shift(lag)) for lag in range(-int(seconds*fps),int(seconds*fps+1))]
+    center = len(crosscorr)//2 #Index of the zero lag
+    peak_idx = np.argmax(abs(np.array(crosscorr)))
+    offset_peak = np.around((center-peak_idx)/fps, decimals=3)
+    corr_peak = crosscorr[peak_idx]
+    corr_centered = crosscorr[center]
+    p_value_center = round((100-percentileofscore(abs(np.array(null_dist_corr)), abs(corr_centered), kind='strict'))/100,3)
+    p_value_peak = round((100-percentileofscore(abs(np.array(null_dist_corr)), abs(corr_peak), kind='strict'))/100,3)
+
+    return d1, d2, crosscorr, corr_centered, corr_peak,  p_value_center, p_value_peak, offset_peak, null_dist_corr
+
+
+# Source: Tom_elife_code/new_functions.py (2022-01)
+def get_response_dict_ephyvivo(reM):
+    """
+    Compute the responses of the cells of an in vivo ephys record to each stimulus present:
+    checkerboard and fullfield flicker STAs (with p-values), fullfield flicker nonlinearity,
+    moving gratings direction selectivity, chirp AM and FM repeats (new or old chirp
+    version), spike counts and firing rates per stimulus, and the background firing rate.
+    Assumes a 60 Hz frame rate and the stimulus lengths of the protocol used for Tom's
+    eLife dataset.
+
+    params:
+        - reM: RecordMaster of the record
+
+    return:
+        - response_dict: Dictionary of the responses, keyed by stimulus
+
+    Changes from the original: the number of cells of the chirp entries is read from the
+    chirp data (the original read it from the previous stimulus, and failed with a
+    NameError on a record with chirps only), and "background_sprate" is only set when the
+    record has frames outside the stimuli (the original failed with a NameError otherwise).
+    """
+    response_dict = {}
+    if "checkerboard" in reM.keys():
+        pipe = Data_Pipe(reM, ["checkerboard", "S_matrix"],
+                              ["stim_inten", "spike_counts"])
+        pipe += "checkerboard"
+        if pipe[0]["stim_inten"].shape[-1] != 32: #Thats the big checker
+            pipe = Data_Pipe(reM, ["checkerboard_2", "S_matrix"],
+                              ["stim_inten", "spike_counts"])
+            pipe += "checkerboard_2"
+        response_dict["checkerboard"] = process_sta_batch(**pipe[0], Hw=16, Fw=0, return_pval=True)
+        response_dict["checker_spcount"] = np.sum(pipe[0]["spike_counts"], axis=0)
+        response_dict["checker_sprate"]  = 60 * np.sum(pipe[0]["spike_counts"], axis=0) / len(pipe[0]["spike_counts"])
+
+    if "fullfield_flicker" in reM.keys():
+        pipe = Data_Pipe(reM, ["fullfield_flicker", "S_matrix"], ["stim_inten", "spike_counts"])
+        pipe += "fullfield_flicker"
+        response_dict["fullfield_fl"] = process_sta_batch(**pipe[0], Hw=30, Fw=0, return_pval=True)
+        response_dict["fff_spcount"] = np.sum(pipe[0]["spike_counts"], axis=0)
+        response_dict["fff_sprate"]  = 60 * np.sum(pipe[0]["spike_counts"], axis=0) / len(pipe[0]["spike_counts"])
+
+        bins = np.arange(-2,2.1,0.1)
+        nonlinearities = process_nonlinearity(**pipe[0], bins=bins, stas=response_dict["fullfield_fl"][0], p_norm=2)
+        response_dict["nonlinearity"] = nonlinearities*60
+
+    if "moving_gratings" in reM.keys():
+        pipe = Data_Pipe(reM, ["S_matrix", "moving_gratings"], ["spike_counts", "stim_inten"])
+        pipe += "moving_gratings"
+        data_dict = group_direction_response(pipe[0]["stim_inten"], pipe[0]["spike_counts"], n_repeat=5)
+        response_dict["moving_gratings"] = direction_selectivity(data_dict)
+
+    if "chirp_freq_epoch" in reM.keys(): #It's the new chirp version
+        pipe = Data_Pipe(reM, ["S_matrix", "chirp_am"], ["spike_counts", "stim_inten"])
+        pipe += "chirp_am"
+        ncell = pipe[0]["spike_counts"].shape[1]
+        spike_counts, n_error     = get_repeat_corrected(**pipe[0])
+        response_dict["chirp_am"] = (pipe[0]["stim_inten"], spike_counts, n_error)
+        response_dict["cham_spcount"] = np.array(np.sum(pipe[0]["spike_counts"], axis=0)).astype(int)
+        response_dict["cham_sprate"]  = np.array(60 * response_dict["cham_spcount"] / len(pipe[0]["spike_counts"]))
+
+        pipe = Data_Pipe(reM, ["S_matrix", "chirp_freq_epoch"], ["spike_counts", "stim_inten"])
+        pipe += "chirp_freq_epoch"
+        spike_counts, n_error     = get_repeat_corrected(**pipe[0])
+        response_dict["chirp_fm"] = (pipe[0]["stim_inten"], spike_counts, n_error)
+        response_dict["chfm_spcount"] = np.array(np.sum(pipe[0]["spike_counts"], axis=0)).astype(int)
+        response_dict["chfm_sprate"]  = np.array(60 * response_dict["chfm_spcount"] / len(pipe[0]["spike_counts"]))
+
+        response_dict["chirp_version"] = np.array((["new"]*ncell))
+
+    elif "chirp_am" in reM.keys(): #Chirp is present but since it's not the new version, it's the old one!
+        pipe = Data_Pipe(reM, ["S_matrix", "chirp_am"], ["spike_counts", "stim_inten"])
+        pipe += "chirp_am"
+        ncell = pipe[0]["spike_counts"].shape[1]
+        tmp, n_error         = get_repeat_corrected(**pipe[0])
+        spike_counts         = np.zeros((10,1020,ncell))
+        spike_counts[:,:840] = tmp
+        response_dict["chirp_am"] = (pipe[0]["stim_inten"], spike_counts, n_error)
+        response_dict["cham_spcount"] = np.array(np.sum(pipe[0]["spike_counts"], axis=0)).astype(int)
+        response_dict["cham_sprate"]  = np.array(60 * response_dict["cham_spcount"] / len(pipe[0]["spike_counts"]))
+
+        pipe = Data_Pipe(reM, ["S_matrix", "chirp_fm"], ["spike_counts", "stim_inten"])
+        pipe += "chirp_fm"
+        tmp, n_error         = get_repeat_corrected(**pipe[0])
+        spike_counts         = np.zeros((10,868,ncell))
+        spike_counts[:,:840] = tmp
+        response_dict["chirp_fm"] = (pipe[0]["stim_inten"], spike_counts, n_error)
+        response_dict["chfm_spcount"] = np.array(np.sum(pipe[0]["spike_counts"], axis=0)).astype(int)
+        response_dict["chfm_sprate"]  = np.array(60 * response_dict["chfm_spcount"] / len(pipe[0]["spike_counts"]))
+
+        response_dict["chirp_version"] = np.array((["old"]*ncell))
+
+
+    pipe = Data_Pipe(reM, "S_matrix", cast_to_np=True)
+    pipe += "signals"
+    pipe -= "stim"
+    if len(pipe)>0:
+        n_spike, n_frame = np.sum(pipe[0]["S_matrix"], axis=0), len(pipe[0]["S_matrix"])
+        for res_d in pipe[1:]:
+            n_spike  = n_spike + np.sum(res_d["S_matrix"], axis=0)
+            n_frame += len(res_d["S_matrix"])
+        response_dict["background_sprate"] = np.array(60*n_spike/n_frame)
+
+    return response_dict
+
+
+# Source: Tom_elife_code/new_functions.py (2022-01)
+def cart2pol(x, y):
+    """Cartesian to polar coordinates. Returns (rho, phi)."""
+    rho = np.sqrt(x**2 + y**2)
+    phi = np.arctan2(y, x)
+    return(rho, phi)
+
+
+# Source: Tom_elife_code/new_functions.py (2022-01)
+def pol2cart(rho, phi):
+    """Polar to cartesian coordinates. Returns (x, y)."""
+    return rho*np.cos(phi), rho*np.sin(phi)
+
+
+# Source: Tom_elife_code/new_functions.py (2022-01)
+def sta_plotting(stas, title, offset=0, ax=None, title_size=12, ticks_size=6, label_size=8, show_time=False):
+    """
+    Plot temporal STAs of a population as an image, one row per cell, in grayscale
+    from -1 to 1. The time ticks assume 16 frames at 60 Hz, the last one at the spike.
+
+    params:
+        - stas: Array of shape (n_cell, 16) with the STAs, normalised to [-1, 1]
+        - title: Title of the plot
+        - offset: Added to the cell index on the y axis
+        - ax: The axis for the plot. If None, a new plot is created
+        - title_size, ticks_size, label_size: Font sizes
+        - show_time: Show the time axis
+
+    return:
+        - The image returned by ax.imshow
+    """
+    if ax is None:
+        fig, ax = plt.subplots()
+    im = ax.imshow(stas, aspect="auto", vmin=-1, vmax=1, interpolation="nearest", cmap="gray")
+    ax.set_title(title+"             ", size=title_size, y=.975)
+    ax.set_xticks(ticks=[3,9,15])
+    ax.set_xticklabels([-200,-100, 0], size=ticks_size)
+    ax.set_yticklabels(np.fromiter(ax.get_yticks(), dtype=int)+offset, size=ticks_size)
+    ax.set_xlabel("time before spike [ms]              ", size=label_size)
+    ax.set_ylabel("cell index", size=label_size)
+    ax.spines['right'].set_color('none')
+    ax.spines['top'].set_color('none')
+    ax.set_xlim(0,21)
+    ax.spines['bottom'].set_bounds((0, 15.5))
+    if not show_time:
+        ax.set_xlabel("")
+        ax.set_xticks([])
+    return im
+
+
+# Source: Tom_elife_code/new_functions.py (2022-01)
+def sta_pca_plotting(stas, condition, invert=False, phase_shift=0, pc1_shift=0, pc2_shift=0):
+    """
+    Order cells by the angle of their temporal STA in the plane of the first two
+    principal components, and plot the PCA scatter and the ordered STAs (`sta_plotting`).
+
+    params:
+        - stas: Array of shape (n_cell, n_frame) with the temporal STAs (last frame at the spike)
+        - condition: Name of the condition, used in the titles
+        - invert: Reverse the direction of the angle
+        - phase_shift: Rotation added to the angle, in radians
+        - pc1_shift, pc2_shift: Origin of the polar coordinates in the PC plane
+
+    return:
+        - order_: Indices that sort the cells by angle
+        - phi_: Angle of each cell in radians
+    """
+    pca_ = PCA(n_components=2)
+    fit = pca_.fit(stas)
+    print(condition, "explained variance: PC1:{0[0]}% - PC2:{0[1]}% ".format(np.round(fit.explained_variance_ratio_*100, 2)))
+    pcomp_ = fit.transform(stas)
+
+    rho_, phi_ = cart2pol(pcomp_[:,0]-pc1_shift, pcomp_[:,1]-pc2_shift)
+    phi_ = (-phi_ + np.pi*2 + phase_shift)%(np.pi*2)
+
+    if invert:
+        phi_ = np.pi*2 - phi_
+
+    order_ = np.argsort(phi_)
+
+    plt.figure()
+    x, y = pol2cart(rho_, phi_)
+    plt.scatter(x, y, c="black")
+    plt.title("t-STA PCA – "+str(condition), size=20)
+    plt.xlabel("PCA 1", size=14)
+    plt.ylabel("PCA 2", size=14)
+    plt.xticks(size=12)
+    plt.yticks(size=12)
+
+    sta_plotting(stas[order_][:,-16:], "t-STAs – "+str(condition), title_size=20, ticks_size=12, label_size=14)
+
+    return order_, phi_
+
+
+# Source: Tom_elife_code/shared_functions.py (2022-01)
+def retrieve_array(df, base_key, shape=(-1,), sortkey=None):
+    """
+    Retrieves a multidimensional array stored in a dataframe. The array must be stored like "foo.bar.0001", with
+    the number beeing alphabetically sorted (the zero padding matters!)
+    params:
+        - df: The dataframe containing the array to retrieve
+        - base_key: The basepath of the key under which the array is stored. From the above example: "foo.bar."
+        - shape: The original shape of the multidimensional array
+        - sortkey: column name with which the results are sorted (optional)
+    """
+    reg = re.compile("^"+base_key+r"\d+$")
+    nrow = len(df)
+
+    col_list = np.array(list(df.columns[df.columns.str.contains(base_key+"[0-9]")]))
+    mask_col = [reg.search(col) is not None for col in col_list]
+    if sortkey is None:
+        res = np.array(df.loc[:, col_list[mask_col]]).reshape(nrow, *shape)
+    else:
+        res = np.array(df.sort_values(sortkey).loc[:, col_list[mask_col]]).reshape(nrow, *shape)
+    return res
+
+
+# Source: Tom_elife_code/shared_functions.py (2022-01) and Read df examples.ipynb (2023-07)
+def retrieve_fit(serie, base_key, reverse_order=False, quality_key=None):
+    """
+    Retrieves a dictionnary key/value for the fit of a function.
+        - serie: The serie to which the parameters must be retrieved
+        - base_key: The basepath of the key under which the array is stored like "stim.fit."
+        - reverse_order: If True, reverse the order of the nested dict
+        - quality_key: Name of the fit quality entry. If None, the first of "QI" and "R2"
+          found in the serie is used
+
+    return:
+        - fit_d: Dictionary of the fit parameters
+        - quality: Value of the fit quality entry, or None
+
+    Merges the two versions of this function: the 2022 one read "R2", the 2023 one "QI".
+    """
+
+    def reverse_nest_dicts(nested_dict):
+        reverse_nest_dict = {}
+        for k, v in nested_dict.items():
+            for k2, v2 in v.items():
+                try:
+                    reverse_nest_dict[k2][k] = v2
+                except KeyError:
+                    reverse_nest_dict[k2] = { k : v2 }
+        return reverse_nest_dict
+
+    quality_keys = ("QI", "R2") if quality_key is None else (quality_key,)
+    tmp_d = serie.filter(regex=(base_key+"*")).to_dict()
+    fit_d = {}
+    found = {}
+    for k, v in tmp_d.items():
+        new_k = k.split(".")[-1]
+        if new_k in quality_keys:
+            found[new_k] = tmp_d[k]
+        else:
+            fit_d[new_k] = v
+    quality = next((found[k] for k in quality_keys if k in found), None)
+    if reverse_order:
+        fit_d = reverse_nest_dicts(fit_d)
+    return fit_d, quality
+
+
+# Source: Tom_elife_code/shared_functions.py (2022-01)
+def pval_stars(pval, bonf_corr=1):
+    """
+    Significance stars of a p-value, with a Bonferroni correction for bonf_corr
+    comparisons: "***", "**", "*" or "ns".
+    Change from the original: bonf_corr defaults to 1 (no correction).
+    """
+    if   pval<(0.001/bonf_corr):
+        return "***"
+    elif pval<(0.01/bonf_corr):
+        return "**"
+    elif pval<(0.05/bonf_corr):
+        return "*"
+    else:
+        return "ns"
+
+
+# Source: Tom_elife_code/shared_functions.py (2022-01)
+def plot_stats(ax, pos_l, star_l, statbar_w=1, statsize=8, log_scale=False):
+    """
+    Draw significance bars with their label on an axis.
+
+    params:
+        - ax: The axis to draw on (its y limits must already be set)
+        - pos_l: List of (x1, x2, yf): bar from x1 to x2, at the fraction yf of the y range
+        - star_l: List of labels, e.g. from `pval_stars`
+        - statbar_w: Line width of the bars
+        - statsize: Font size of the labels
+        - log_scale: True if the y axis is in log scale
+    """
+    ymin, ymax   = ax.get_ylim()
+    if not log_scale:
+        yrange = ymax-ymin
+        for (x1, x2, yf), s in zip(pos_l, star_l):
+            ax.hlines(ymax-(yrange*(1-yf)), xmin=x1, xmax=x2, color="black", linewidth=statbar_w)
+            ax.vlines(x1, ymin=ymax-(yrange*(1-yf+.02)), ymax=ymax-(yrange*(1-yf)), color="black", linewidth=statbar_w)
+            ax.vlines(x2, ymin=ymax-(yrange*(1-yf+.02)), ymax=ymax-(yrange*(1-yf)), color="black", linewidth=statbar_w)
+            if s =="ns":
+                ax.text(x=(x1+(x2-x1)/2), y=ymax-(yrange*(1-yf-.01)), s=s, ha='center', size=statsize)
+            else:
+                ax.text(x=(x1+(x2-x1)/2), y=ymax-(yrange*(1-yf)), s=s, ha='center', size=statsize)
+    else:
+        ymin, ymax = np.log10(ymin), np.log10(ymax)
+        yrange = ymax-ymin
+        for (x1, x2, yf), s in zip(pos_l, star_l):
+            ax.hlines(10**(ymax-(yrange*(1-yf))), xmin=x1, xmax=x2, color="black", linewidth=statbar_w)
+            ax.vlines(x1, ymin=10**(ymax-(yrange*(1-yf+.02))), ymax=10**(ymax-(yrange*(1-yf))), color="black", linewidth=statbar_w)
+            ax.vlines(x2, ymin=10**(ymax-(yrange*(1-yf+.02))), ymax=10**(ymax-(yrange*(1-yf))), color="black", linewidth=statbar_w)
+            if s =="ns":
+                ax.text(x=(x1+(x2-x1)/2), y=10**(ymax-(yrange*(1-yf-.01))), s=s, ha='center', size=statsize)
+            else:
+                ax.text(x=(x1+(x2-x1)/2), y=10**(ymax-(yrange*(1-yf))), s=s, ha='center', size=statsize)
+
+
+# Source: Code_Histamine_Paper/Data_exploration_20240730_111909.ipynb (2024-07)
+def fit_model(params, tfs, obsresp):
+    """
+    Fit `doeModelInt` to a temporal frequency tuning curve, starting from params.
+
+    params:
+        - params: Initial parameters (base, excGain, excTc, inhGain, inhTc)
+        - tfs: Temporal frequencies
+        - obsresp: Observed responses
+
+    return:
+        - (ss_res, popt): residual sum of squares and fitted parameters, or None if the fit fails
+    """
+    try:
+        popt, pcov = curve_fit(doeModelInt, tfs, obsresp, p0=params,
+                               bounds=([0, 0, 0, 0, 0], [np.inf, np.inf, 40, np.inf, 40]), method='trf')
+        residuals = obsresp - doeModelInt(tfs, *popt)
+        ss_res = np.sum(residuals**2)
+        return (ss_res, popt)
+    except Exception:
+        return None
